@@ -1,0 +1,382 @@
+#!/usr/bin/env perl
+
+use 5.006001;
+use strict;
+use warnings;
+
+use Getopt::Long qw( GetOptions );
+
+GetOptions("a=s",       \(my $stap_args),
+           "d",         \(my $dump_src),
+           "h",         \(my $help),
+           "p=i",       \(my $pid),
+           "l=i",       \(my $limit),
+           "t=i",       \(my $time))
+    or die usage();
+
+if ($help) {
+    print usage();
+    exit;
+}
+
+if (!defined $pid) {
+    die "No process pid specified by the -p option.\n";
+}
+
+if (!defined $time) {
+    die "No -t <seconds> option specified.\n";
+}
+
+if (!defined $limit) {
+    $limit = 1024;
+}
+
+if (!defined $stap_args) {
+    $stap_args = '';
+}
+
+if ($stap_args !~ /(?:^|\s)-D\s*MAXACTION=/) {
+    $stap_args .= " -DMAXACTION=100000"
+}
+
+if ($stap_args !~ /(?:^|\s)-D\s*MAXMAPENTRIES=/) {
+    $stap_args .= " -DMAXMAPENTRIES=5000"
+}
+
+if ($stap_args !~ /(?:^|\s)-D\s*MAXBACKTRACE=/) {
+    $stap_args .= " -DMAXBACKTRACE=200"
+}
+
+if ($stap_args !~ /(?:^|\s)-D\s*MAXSTRINGLEN=2048/) {
+    $stap_args .= " -DMAXSTRINGLEN=2048"
+}
+
+if ($stap_args !~ /(?:^|\s)-D\s*MAXSKIPPED=1024/) {
+    $stap_args .= " -DMAXSKIPPED=1024"
+}
+
+if ($^O ne 'linux') {
+    die "Only linux is supported but I am on $^O.\n";
+}
+
+my $exec_file = "/proc/$pid/exe";
+if (!-f $exec_file) {
+    die "process $pid is not running or ",
+        "you do not have enough permissions.\n";
+}
+
+my $skynet_path = readlink $exec_file;
+
+my $condition = "my_pid == target()";
+
+my $ver = `stap --version 2>&1`;
+if (!defined $ver) {
+    die "Systemtap not installed or its \"stap\" utility is not visible to the PATH environment: $!\n";
+}
+
+if ($ver =~ /version\s+(\d+\.\d+)/i) {
+    my $v = $1;
+    if ($v < 2.1) {
+        die "ERROR: at least systemtap 2.1 is required but found $v\n";
+    }
+
+} else {
+    die "ERROR: unknown version of systemtap:\n$ver\n";
+}
+
+my $lua_path = $skynet_path;
+
+my $stap_src = <<_EOC_;
+
+probe begin {
+    warn("Tracing $pid ($skynet_path) for Lua 5.4 ...\\n")
+}
+
+global bts
+global lua_states
+
+probe process("$lua_path").function("lua_resume*"), process("$lua_path").function("lua_pcall*")
+{
+    my_pid = pid()
+    if ($condition) {
+        lua_states[my_pid] = \$L
+    }
+}
+
+probe process("$lua_path").function("lua_yield*")
+{
+    my_pid = pid()
+    if ($condition) {
+        lua_states[my_pid] = 0
+    }
+}
+
+function s2v(o) {
+    return &\@cast(o, "StackValue", "$lua_path")->val
+}
+
+function gco2lcl(o) {
+    closure = &\@cast(o, "GCUnion", "$lua_path")->cl
+    return &\@cast(closure, "Closure", "$lua_path")->l
+}
+
+function gco2cl(o) {
+    return &\@cast(o, "GCUnion", "$lua_path")->cl
+}
+
+function clLvalue(o) {
+    return gco2lcl(\@cast(o, "TValue", "$lua_path")->value_->gc)
+}
+
+function clvalue(o) {
+    return gco2cl(\@cast(o, "TValue", "$lua_path")->value_->gc)
+}
+
+function ci_func(ci) {
+    return clLvalue(s2v(\@cast(ci, "CallInfo", "$lua_path")->func))
+}
+
+function isLua(ci) {
+    return !(\@cast(ci, "CallInfo", "$lua_path")->callstatus & (1 << 1))
+}
+
+function isTailCall(ci) {
+    return (\@cast(ci, "CallInfo", "$lua_path")->callstatus & (1 << 5))
+}
+
+function ctb(t) {
+    return (t) | (1 << 6)
+}
+
+function makevariant(t, v) {
+    return (t) | ((v) << 4)
+}
+
+function checktag(o, t) {
+    return \@cast(o, "TValue", "$lua_path")->tt_ == (t)
+}
+
+function ttisLclosure(o) {
+    return checktag(o, ctb(makevariant(6, 0)))
+}
+
+function ttisCclosure(o) {
+    return checktag(o, ctb(makevariant(6, 2)))
+}
+
+function ttisclosure(o) {
+    return ttisLclosure(o) || ttisCclosure(o)
+}
+
+function currentpc(ci) {
+    a = \@cast(ci, "CallInfo", "$lua_path")->u->l->savedpc
+    b = \@cast(ci_func(ci), "LClosure", "$lua_path")->p->code
+    return (a - b) - 1
+}
+
+function getcurrentline(ci) {
+    /* Proto *f */
+    f = \@cast(ci_func(ci), "LClosure", "$lua_path")->p
+
+    pc = currentpc(ci)
+
+    sizeabslineinfo = \@cast(f, "Proto", "$lua_path")->sizeabslineinfo
+    basepc = -1
+    baseline = -1
+    if (\@cast(f, "Proto", "$lua_path")->lineinfo != 0) {
+        if (sizeabslineinfo == 0 || pc < \@cast(f, "Proto", "$lua_path")->abslineinfo[0]->pc) {
+            baseline = \@cast(f, "Proto", "$lua_path")->linedefined
+        } else {
+            i = pc / 128 - 1
+            while (i + 1 < sizeabslineinfo && pc >= \@cast(f, "Proto", "$lua_path")->abslineinfo[i + 1]->pc) {
+                i++
+            }
+            basepc = \@cast(f, "Proto", "$lua_path")->abslineinfo[i]->pc
+            baseline = \@cast(f, "Proto", "$lua_path")->abslineinfo[i]->line
+        }
+        while (basepc++ < pc) {
+            baseline += \@cast(f, "Proto", "$lua_path")->lineinfo[basepc]
+        }
+    }
+    return baseline
+}
+
+function lua_getinfo(L, i_ci) {
+    ci = 0  /* CallInfo *ci */
+    f = 0   /* TValue *f */
+    cl = 0  /* Closure *cl */
+
+    ci = i_ci
+    f = s2v(\@cast(ci, "CallInfo", "$lua_path")->func)
+
+    if ((\@cast(f, "TValue", "$lua_path")->tt_ & 0x3F) != 0x06) {
+        return ""
+    }
+
+    if (ttisclosure(f)) {
+        cl = clvalue(f)
+    }
+    str = ""
+    if ((cl == 0) || (\@cast(cl, "Closure", "$lua_path")->c->tt == makevariant(6, 2))) {
+        // c func
+        str = "=[C]"
+    } else {
+        p = \@cast(cl, "Closure", "$lua_path")->l->p
+        source = \@cast(p, "Proto", "$lua_path")->source
+        if (source) {
+            str = user_string(\@cast(source, "TString", "$lua_path")->contents)
+        } else {
+            str = "=?"
+        }
+    }
+
+    currentline = -1
+    if (ci && isLua(ci)) {
+        currentline = getcurrentline(ci)
+    }
+
+    if (currentline <= 0) {
+        return sprintf("%s:%d", str, -1)
+    } else {
+        return sprintf("%s:%d", str, currentline)
+    }
+}
+
+function lua_getstack(L, level) {
+    ci = \@cast(L, "lua_State", "$lua_path")->ci
+    base_ci = &\@cast(L, "lua_State", "$lua_path")->base_ci
+    for (; level > 0 && ci != base_ci; ci = \@cast(ci, "CallInfo", "$lua_path")->previous) {
+        level--
+    }
+    if (level == 0 && ci != base_ci) {  /* level found? */
+        return ci
+    }
+    return 0
+}
+
+function lastlevel(L) {
+    li = 1
+    le = 1
+    while (lua_getstack(L, le)) {
+        li = le
+        le *= 2
+    }
+    while (li < le) {
+        m = (li + le) / 2
+        if (lua_getstack(L, m))
+            li = m + 1
+        else
+            le = m
+    }
+    return le - 1
+}
+
+probe timer.profile {
+    my_pid = pid()
+    if ($condition) {
+        L = lua_states[my_pid]
+        if (L) {
+            stack = ""
+            level = 0
+
+            last = lastlevel(L)
+            limit2show = -1
+            if (last - level > 21)
+                limit2show = 10
+
+            while (1) {
+                i_ci = lua_getstack(L, level++)
+                if (i_ci == 0) {
+                    break
+                }
+
+                if (limit2show-- == 0) {
+                    n = last - level - 10
+                    stack .= sprintf("skipping_levels:%d", n) . "\\n"
+                    level += n
+                } else {
+                    frame = lua_getinfo(L, i_ci)
+                    stack .= frame . "\\n"
+                    if (isTailCall(i_ci)) {
+                        stack .= "tail_calls" . "\\n"
+                    }
+                }
+            }
+
+            if (stack != "") {
+                bts[stack] <<< 1
+            }
+        }
+    }
+}
+
+probe timer.s($time)
+{
+    warn("Time's up. Quitting now...\\n")
+    foreach (bt in bts- limit $limit) {
+        printf("%s\\t%d\\n", bt, \@count(bts[bt]))
+    }
+    exit()
+}
+_EOC_
+
+if ($dump_src) {
+    print $stap_src;
+    exit;
+}
+
+my %so_files;
+{
+    my $maps_file = "/proc/$pid/maps";
+    open my $in, $maps_file
+        or die "Cannot open $maps_file for reading: $!\n";
+
+    while (<$in>) {
+        if (/\s+(\/\S+\.so)$/) {
+            if (!exists $so_files{$1}) {
+                $so_files{$1} = 1;
+            }
+        }
+    }
+
+    close $in;
+}
+
+my $d_so_args;
+if (%so_files) {
+    $d_so_args = join " ", map { "-d $_" } sort keys %so_files;
+
+} else {
+    $d_so_args = '';
+}
+
+my $extra_args = '-x ' . $pid;
+
+my $cmd = "stap --skip-badvars --all-modules -d '$skynet_path' --ldd $d_so_args $extra_args $stap_args -v -";
+
+open my $in, "|$cmd"
+    or die "Cannot run stap: $!\n";
+
+print $in $stap_src;
+
+close $in;
+
+sub usage {
+    return <<'_EOC_';
+Usage:
+    lua-bt [optoins]
+
+Options:
+    -a <args>           Pass extra arguments to the stap utility.
+    -d                  Dump out the systemtap script source.
+    -h                  Print this usage.
+    -l <count>          Only output <count> most frenquent backtrace samples.
+                        (Default to 1024)
+    -p <pid>            Specify the nginx process pid.
+    -t <seconds>        Specify the number of seconds for sampling.
+
+Examples:
+    lua-bt -p 12345 -t 10
+    lua-bt -p 12345 -t 5 -a '-DMAXACTION=100000'
+_EOC_
+}

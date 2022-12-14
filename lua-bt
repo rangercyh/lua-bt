@@ -364,7 +364,7 @@ close $in;
 sub usage {
     return <<'_EOC_';
 Usage:
-    lua_bt [optoins]
+    lua-bt [optoins]
 
 Options:
     -a <args>           Pass extra arguments to the stap utility.
@@ -376,7 +376,7 @@ Options:
     -t <seconds>        Specify the number of seconds for sampling.
 
 Examples:
-    lua_bt -p 12345 -t 10
-    lua_bt -p 12345 -t 5 -a '-DMAXACTION=100000'
+    lua-bt -p 12345 -t 10
+    lua-bt -p 12345 -t 5 -a '-DMAXACTION=100000'
 _EOC_
 }

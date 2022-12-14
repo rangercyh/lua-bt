@@ -26,7 +26,7 @@ vim /usr/src/kernels/3.10.0-862.14.4.el7.x86_64/include/generated/compile.h
 # usage
 
 ```
-lua_bt -h
+lua-bt -h
 stackcollapse-stap.pl a.bt > a.cbt
 flamegraph.ph a.cbt > a.svg
 ```
